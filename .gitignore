@@ -1,0 +1,24 @@
+# JetBrains / CLion
+.idea/
+*.iml
+
+# CLion build directories
+cmake-build-*/
+
+# CMake generated files
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# STM32CubeIDE generated metadata, if present
+.project
+.cproject
+.settings/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
