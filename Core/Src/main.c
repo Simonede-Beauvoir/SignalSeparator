@@ -18,11 +18,18 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "adc.h"
+#include "bdma.h"
+#include "tim.h"
 #include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "adc_capture.h"
+#include "signal_fft.h"
+
+#include <stdio.h>
 
 /* USER CODE END Includes */
 
@@ -44,13 +51,16 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+static uint8_t fftAnalysisCompleted = 0U;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+void PeriphCommonClock_Config(void);
 static void MPU_Config(void);
 /* USER CODE BEGIN PFP */
+static void PrintFFTResult(const SignalFftResult* result);
 
 /* USER CODE END PFP */
 
@@ -83,21 +93,68 @@ int main(void) {
     /* Configure the system clock */
     SystemClock_Config();
 
+    /* Configure the peripherals common clocks */
+    PeriphCommonClock_Config();
+
     /* USER CODE BEGIN SysInit */
 
     /* USER CODE END SysInit */
 
     /* Initialize all configured peripherals */
     MX_GPIO_Init();
+    MX_BDMA_Init();
     MX_USART1_UART_Init();
     MX_USART2_UART_Init();
+    MX_ADC3_Init();
+    MX_TIM2_Init();
     /* USER CODE BEGIN 2 */
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    printf("\r\n");
+    printf("========================================\r\n");
+    printf("Signal separator FFT test\r\n");
+    printf("Buffer size: %lu samples\r\n", (unsigned long)ADC_CAPTURE_BUFFER_SIZE);
+    printf("Target rate: %lu samples/s\r\n", (unsigned long)ADC_CAPTURE_SAMPLE_RATE_HZ);
+    printf("========================================\r\n");
+
+    if (SignalFFT_Init() != ARM_MATH_SUCCESS) {
+        printf("ERROR: CMSIS-DSP FFT initialization failed.\r\n");
+        Error_Handler();
+    }
+
+    if (ADC_Capture_Start() != HAL_OK) {
+        printf("ERROR: ADC capture start failed.\r\n");
+        Error_Handler();
+    }
+
+    ADC_Capture_RequestSnapshot();
+
+    printf("ADC3 sampling started.\r\n");
+    printf("One 4096-sample FFT snapshot requested.\r\n");
 
     /* USER CODE END 2 */
 
     /* Infinite loop */
     /* USER CODE BEGIN WHILE */
     while (1) {
+        ADC_Capture_Process();
+
+        if (fftAnalysisCompleted == 0U && ADC_Capture_IsSnapshotReady() != 0U) {
+            SignalFftResult result;
+
+            bool success = SignalFFT_Analyze(ADC_Capture_GetSnapshot(), ADC_CAPTURE_BUFFER_SIZE, ADC_CAPTURE_SAMPLE_RATE_HZ, &result);
+
+            if (success) {
+                PrintFFTResult(&result);
+            }
+            else {
+                printf("FFT analysis failed: two valid peaks were not found.\r\n");
+            }
+
+            ADC_Capture_ReleaseSnapshot();
+            fftAnalysisCompleted = 1U;
+        }
+
         /* USER CODE END WHILE */
 
         /* USER CODE BEGIN 3 */
@@ -126,8 +183,10 @@ void SystemClock_Config(void) {
     /** Initializes the RCC Oscillators according to the specified parameters
     * in the RCC_OscInitTypeDef structure.
     */
-    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI | RCC_OSCILLATORTYPE_HSE;
     RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+    RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
+    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
     RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
     RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
     RCC_OscInitStruct.PLL.PLLM = 5;
@@ -159,7 +218,64 @@ void SystemClock_Config(void) {
     }
 }
 
+/**
+  * @brief Peripherals Common Clock Configuration
+  * @retval None
+  */
+void PeriphCommonClock_Config(void) {
+    RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
+
+    /** Initializes the peripherals clock
+    */
+    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_CKPER;
+    PeriphClkInitStruct.CkperClockSelection = RCC_CLKPSOURCE_HSI;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK) {
+        Error_Handler();
+    }
+}
+
 /* USER CODE BEGIN 4 */
+/**
+  * @brief  Redirects printf output to USART1.
+  * @param  ch Character to transmit.
+  * @retval Transmitted character, or EOF on failure.
+  */
+int __io_putchar(int ch) {
+    uint8_t data = (uint8_t)ch;
+
+    if (HAL_UART_Transmit(&huart1, &data, 1U, HAL_MAX_DELAY) != HAL_OK) {
+        return EOF;
+    }
+
+    return ch;
+}
+
+/**
+  * @brief  Prints one FFT analysis result without float printf support.
+  * @param  result FFT result.
+  */
+static void PrintFFTResult(const SignalFftResult* result) {
+    uint32_t frequencyA = (uint32_t)(result->signalA.frequencyHz + 0.5f);
+    uint32_t nominalFrequencyA = (uint32_t)(result->signalA.nominalFrequencyHz + 0.5f);
+    uint32_t amplitudeA = (uint32_t)(result->signalA.amplitudePeakToPeakCode + 0.5f);
+
+    uint32_t frequencyB = (uint32_t)(result->signalB.frequencyHz + 0.5f);
+    uint32_t nominalFrequencyB = (uint32_t)(result->signalB.nominalFrequencyHz + 0.5f);
+    uint32_t amplitudeB = (uint32_t)(result->signalB.amplitudePeakToPeakCode + 0.5f);
+
+    uint32_t meanCode = (uint32_t)(result->meanCode + 0.5f);
+    uint32_t fftTimeUs = (uint32_t)(result->fftTimeUs + 0.5f);
+    uint32_t totalTimeUs = (uint32_t)(result->totalTimeUs + 0.5f);
+
+    printf("\r\n[FFT_RESULT]\r\n");
+    printf("Mean: %lu codes\r\n", (unsigned long)meanCode);
+    printf("A: raw=%lu Hz, nominal=%lu Hz, bin=%lu, amplitude=%lu codes Vpp\r\n", (unsigned long)frequencyA, (unsigned long)nominalFrequencyA,
+           (unsigned long)result->signalA.peakBin, (unsigned long)amplitudeA);
+    printf("B: raw=%lu Hz, nominal=%lu Hz, bin=%lu, amplitude=%lu codes Vpp\r\n", (unsigned long)frequencyB, (unsigned long)nominalFrequencyB,
+           (unsigned long)result->signalB.peakBin, (unsigned long)amplitudeB);
+    printf("FFT time: %lu us, total analysis: %lu us\r\n", (unsigned long)fftTimeUs, (unsigned long)totalTimeUs);
+    printf("[FFT_RESULT_END]\r\n");
+}
 
 /* USER CODE END 4 */
 
@@ -196,8 +312,8 @@ void MPU_Config(void) {
   */
 void Error_Handler(void) {
     /* USER CODE BEGIN Error_Handler_Debug */
-    /* User can add his own implementation to report the HAL error return state */
     __disable_irq();
+
     while (1) {}
     /* USER CODE END Error_Handler_Debug */
 }
