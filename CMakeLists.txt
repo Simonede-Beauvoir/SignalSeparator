@@ -34,6 +34,10 @@ enable_language(C ASM)
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
 
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
+        $<$<CONFIG:Release>:-O3>
+)
+
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
 
@@ -49,6 +53,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
         Core/Src/adc_capture.c
         Core/Src/signal_fft.c
+        Core/Src/signal_zoom_fft.c
 )
 
 # Add include paths

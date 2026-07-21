@@ -9,21 +9,17 @@
 extern "C" {
 #endif
 
-/* ADC capture configuration. */
 #define ADC_CAPTURE_BUFFER_SIZE                 4096U
 #define ADC_CAPTURE_BUFFER_ADDRESS              0x3800E000UL
 #define ADC_CAPTURE_SAMPLE_RATE_HZ              3200000U
 
-/* Periodic sample-rate report. */
-#define ADC_CAPTURE_RATE_REPORT_ENABLE          1U
+#define ADC_CAPTURE_RATE_REPORT_ENABLE          0U
 #define ADC_CAPTURE_RATE_REPORT_INTERVAL_MS     1000U
 
-/*
- * Keep this disabled while the main loop consumes the snapshot for FFT.
- * Set to 1 only when you want the ADC module itself to print all samples.
- */
 #define ADC_CAPTURE_PRINT_ALL_SAMPLES           0U
 #define ADC_CAPTURE_PRINT_VALUES_PER_LINE       16U
+
+typedef void (*ADC_CaptureStreamCallback)(const uint16_t* samples, uint32_t sampleCount);
 
 /**
   * @brief  Calibrates ADC3 and starts ADC3, BDMA, and TIM2.
@@ -33,7 +29,6 @@ HAL_StatusTypeDef ADC_Capture_Start(void);
 
 /**
   * @brief  Services rate reporting and optional sample printing.
-  * @note   Call continuously from the main loop.
   */
 void ADC_Capture_Process(void);
 
@@ -59,6 +54,18 @@ const uint16_t* ADC_Capture_GetSnapshot(void);
   * @brief  Releases the current snapshot after CPU processing is complete.
   */
 void ADC_Capture_ReleaseSnapshot(void);
+
+/**
+  * @brief  Installs a consecutive raw-sample stream callback.
+  * @param  callback Callback invoked from ADC DMA half/full interrupts.
+  * @note   The callback must be non-blocking and must not call printf.
+  */
+void ADC_Capture_SetStreamCallback(ADC_CaptureStreamCallback callback);
+
+/**
+  * @brief  Removes the current raw-sample stream callback.
+  */
+void ADC_Capture_ClearStreamCallback(void);
 
 #ifdef __cplusplus
 }

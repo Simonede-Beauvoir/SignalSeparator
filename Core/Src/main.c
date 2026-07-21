@@ -28,13 +28,22 @@
 /* USER CODE BEGIN Includes */
 #include "adc_capture.h"
 #include "signal_fft.h"
+#include "signal_zoom_fft.h"
 
+#include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef enum {
+    SIGNAL_ANALYSIS_WAIT_COARSE = 0,
+    SIGNAL_ANALYSIS_WAIT_ZOOM,
+    SIGNAL_ANALYSIS_COMPLETE,
+    SIGNAL_ANALYSIS_ERROR
+} SignalAnalysisState;
 
 /* USER CODE END PTD */
 
@@ -51,7 +60,13 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-static uint8_t fftAnalysisCompleted = 0U;
+static SignalAnalysisState signalAnalysisState = SIGNAL_ANALYSIS_WAIT_COARSE;
+static SignalFftResult coarseFftResult;
+static bool coarseModelFallbackAvailable;
+static uint8_t uartRxByte;
+static char uartCommandBuffer[16];
+static volatile uint32_t uartCommandLength;
+static volatile bool uartCommandReady;
 
 /* USER CODE END PV */
 
@@ -60,7 +75,14 @@ void SystemClock_Config(void);
 void PeriphCommonClock_Config(void);
 static void MPU_Config(void);
 /* USER CODE BEGIN PFP */
-static void PrintFFTResult(const SignalFftResult* result);
+static void ProcessCoarseFFT(void);
+static void ProcessZoomFFT(void);
+static void ProcessSerialCommand(void);
+static void PrintCoarseFFTResult(const SignalFftResult* result);
+static void PrintZoomFFTResult(const SignalZoomFftResult* result);
+static bool FindUnresolvedFundamentalCluster(const SignalFftResult* result, float32_t* centerFrequencyHz);
+static uint32_t RoundFloatToUInt32(float32_t value);
+static int32_t RoundFloatToInt32(float32_t value);
 
 /* USER CODE END PFP */
 
@@ -110,15 +132,28 @@ int main(void) {
     /* USER CODE BEGIN 2 */
     setvbuf(stdout, NULL, _IONBF, 0);
 
+    if (HAL_UART_Receive_IT(&huart1, &uartRxByte, 1U) != HAL_OK) {
+        printf("ERROR: USART1 command reception start failed.\r\n");
+        Error_Handler();
+    }
+
     printf("\r\n");
     printf("========================================\r\n");
-    printf("Signal separator FFT test\r\n");
-    printf("Buffer size: %lu samples\r\n", (unsigned long)ADC_CAPTURE_BUFFER_SIZE);
-    printf("Target rate: %lu samples/s\r\n", (unsigned long)ADC_CAPTURE_SAMPLE_RATE_HZ);
+    printf("Signal separator Zoom FFT and harmonic model test\r\n");
+    printf("Coarse FFT: %lu points at %lu samples/s\r\n", (unsigned long)SIGNAL_FFT_SIZE, (unsigned long)ADC_CAPTURE_SAMPLE_RATE_HZ);
+    printf("Peak search: %lu to %lu Hz\r\n", (unsigned long)SIGNAL_FFT_MIN_FREQUENCY_HZ, (unsigned long)SIGNAL_FFT_PEAK_SEARCH_MAX_FREQUENCY_HZ);
+    printf("Models: sine/triangle, complex harmonic overlap\r\n");
+    printf("Zoom FFT: %lu complex points, decimation=%lu\r\n", (unsigned long)SIGNAL_ZOOM_FFT_SIZE, (unsigned long)SIGNAL_ZOOM_FFT_DECIMATION_FACTOR);
+    printf("Commands: RESET\r\n");
     printf("========================================\r\n");
 
     if (SignalFFT_Init() != ARM_MATH_SUCCESS) {
-        printf("ERROR: CMSIS-DSP FFT initialization failed.\r\n");
+        printf("ERROR: coarse CMSIS-DSP FFT initialization " "failed.\r\n");
+        Error_Handler();
+    }
+
+    if (SignalZoomFFT_Init() != ARM_MATH_SUCCESS) {
+        printf("ERROR: CMSIS-DSP Zoom FFT initialization failed.\r\n");
         Error_Handler();
     }
 
@@ -130,29 +165,28 @@ int main(void) {
     ADC_Capture_RequestSnapshot();
 
     printf("ADC3 sampling started.\r\n");
-    printf("One 4096-sample FFT snapshot requested.\r\n");
+    printf("One coarse 4096-sample FFT requested.\r\n");
 
     /* USER CODE END 2 */
 
     /* Infinite loop */
     /* USER CODE BEGIN WHILE */
     while (1) {
+        ProcessSerialCommand();
         ADC_Capture_Process();
 
-        if (fftAnalysisCompleted == 0U && ADC_Capture_IsSnapshotReady() != 0U) {
-            SignalFftResult result;
+        switch (signalAnalysisState) {
+            case SIGNAL_ANALYSIS_WAIT_COARSE:
+                ProcessCoarseFFT();
+                break;
 
-            bool success = SignalFFT_Analyze(ADC_Capture_GetSnapshot(), ADC_CAPTURE_BUFFER_SIZE, ADC_CAPTURE_SAMPLE_RATE_HZ, &result);
+            case SIGNAL_ANALYSIS_WAIT_ZOOM:
+                ProcessZoomFFT();
+                break;
 
-            if (success) {
-                PrintFFTResult(&result);
-            }
-            else {
-                printf("FFT analysis failed: two valid peaks were not found.\r\n");
-            }
-
-            ADC_Capture_ReleaseSnapshot();
-            fftAnalysisCompleted = 1U;
+            case SIGNAL_ANALYSIS_COMPLETE:
+            case SIGNAL_ANALYSIS_ERROR: default:
+                break;
         }
 
         /* USER CODE END WHILE */
@@ -235,6 +269,311 @@ void PeriphCommonClock_Config(void) {
 }
 
 /* USER CODE BEGIN 4 */
+static void ProcessSerialCommand(void) {
+    if (!uartCommandReady) {
+        return;
+    }
+
+    printf("ERROR: unknown command: %s\r\n", uartCommandBuffer);
+    uartCommandLength = 0U;
+    uartCommandReady = false;
+    (void)HAL_UART_Receive_IT(&huart1, &uartRxByte, 1U);
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef* huart) {
+    if (huart->Instance != USART1) {
+        return;
+    }
+
+    if (uartRxByte == '\r' || uartRxByte == '\n') {
+        if (uartCommandLength > 0U) {
+            uartCommandBuffer[uartCommandLength] = '\0';
+
+            if (strcmp(uartCommandBuffer, "RESET") == 0) {
+                NVIC_SystemReset();
+            }
+
+            uartCommandReady = true;
+            return;
+        }
+    }
+    else if (uartCommandLength < sizeof(uartCommandBuffer) - 1U) {
+        uartCommandBuffer[uartCommandLength] = (char)uartRxByte;
+        uartCommandLength++;
+    }
+    else {
+        uartCommandLength = 0U;
+    }
+
+    (void)HAL_UART_Receive_IT(&huart1, &uartRxByte, 1U);
+}
+
+static void ProcessCoarseFFT(void) {
+    if (ADC_Capture_IsSnapshotReady() == 0U) {
+        return;
+    }
+
+    bool success = SignalFFT_Analyze(ADC_Capture_GetSnapshot(), ADC_CAPTURE_BUFFER_SIZE, ADC_CAPTURE_SAMPLE_RATE_HZ, &coarseFftResult);
+
+    PrintCoarseFFTResult(&coarseFftResult);
+    ADC_Capture_ReleaseSnapshot();
+
+    float32_t zoomCenterFrequencyHz = 0.0f;
+    bool unresolvedCluster = FindUnresolvedFundamentalCluster(&coarseFftResult, &zoomCenterFrequencyHz);
+
+    /*
+     * A valid coarse model can still be ambiguous. For example, the third
+     * harmonic of a triangle wave may be fitted as an independent sine while
+     * two close fundamentals remain inside one coarse FFT main lobe. Resolve
+     * that low-frequency cluster with Zoom FFT before accepting the coarse
+     * model. Keep the coarse result as a fallback for a genuine fundamental
+     * plus an unrelated sine near an odd-harmonic frequency.
+     */
+    if (success && !unresolvedCluster) {
+        printf("Decision: complex harmonic model accepted directly from coarse FFT.\r\n");
+        printf("Final signals: A=%lu Hz %s, B=%lu Hz %s\r\n", (unsigned long)RoundFloatToUInt32(coarseFftResult.signalA.frequencyHz),
+               SignalFFT_GetWaveformName(coarseFftResult.signalA.waveform), (unsigned long)RoundFloatToUInt32(coarseFftResult.signalB.frequencyHz),
+               SignalFFT_GetWaveformName(coarseFftResult.signalB.waveform));
+        signalAnalysisState = SIGNAL_ANALYSIS_COMPLETE;
+        return;
+    }
+
+    coarseModelFallbackAvailable = success;
+
+    if (coarseFftResult.significantPeakCount == 0U) {
+        printf("Coarse FFT failed: no significant signal cluster was found.\r\n");
+        signalAnalysisState = SIGNAL_ANALYSIS_ERROR;
+        return;
+    }
+
+    if (!unresolvedCluster) {
+        printf("Model selection failed for already separated coarse peaks.\r\n");
+        signalAnalysisState = SIGNAL_ANALYSIS_ERROR;
+        return;
+    }
+
+    arm_status status = SignalZoomFFT_Start(zoomCenterFrequencyHz, coarseFftResult.meanCode, ADC_CAPTURE_SAMPLE_RATE_HZ);
+    if (status != ARM_MATH_SUCCESS) {
+        printf("ERROR: Zoom FFT acquisition initialization failed, status=%ld.\r\n", (long)status);
+        signalAnalysisState = SIGNAL_ANALYSIS_ERROR;
+        return;
+    }
+
+    printf("Decision: one unresolved coarse cluster; starting DDC and Zoom FFT around %lu Hz.\r\n", (unsigned long)RoundFloatToUInt32(zoomCenterFrequencyHz));
+    ADC_Capture_SetStreamCallback(SignalZoomFFT_PushSamples);
+    signalAnalysisState = SIGNAL_ANALYSIS_WAIT_ZOOM;
+}
+
+static bool FindUnresolvedFundamentalCluster(const SignalFftResult* result, float32_t* centerFrequencyHz) {
+    if (result == NULL || centerFrequencyHz == NULL || result->significantPeakCount == 0U) {
+        return false;
+    }
+
+    if (result->valid && result->signalA.valid && result->signalB.valid && fabsf(result->signalB.frequencyHz - result->signalA.frequencyHz) <= 4.0f * result->
+        binResolutionHz) {
+        *centerFrequencyHz = 0.5f * (result->signalA.frequencyHz + result->signalB.frequencyHz);
+        return true;
+    }
+
+    const SignalFftPeak* fundamentalCluster = NULL;
+
+    for (uint32_t index = 0U; index < result->significantPeakCount; index++) {
+        const SignalFftPeak* peak = &result->significantPeaks[index];
+        if (peak->frequencyHz >= (float32_t)SIGNAL_FFT_MIN_FREQUENCY_HZ && peak->frequencyHz <= (float32_t)SIGNAL_FFT_MAX_FREQUENCY_HZ) {
+            fundamentalCluster = peak;
+            break;
+        }
+    }
+
+    if (fundamentalCluster == NULL) {
+        return false;
+    }
+
+    /*
+     * A close pair produces one coarse fundamental cluster. A triangle-wave
+     * harmonic must not be mistaken for a second already-resolved
+     * fundamental. Four coarse bins cover the frequency bias caused by two
+     * unresolved fundamentals sharing the same Hann-window main lobe.
+     */
+    float32_t harmonicToleranceHz = 5.0f * result->binResolutionHz;
+
+    for (uint32_t index = 0U; index < result->significantPeakCount; index++) {
+        const SignalFftPeak* peak = &result->significantPeaks[index];
+        if (peak == fundamentalCluster) {
+            continue;
+        }
+
+        bool explainedByOddHarmonic = false;
+        for (uint32_t harmonic = 3U; harmonic <= 15U; harmonic += 2U) {
+            float32_t expectedFrequencyHz = fundamentalCluster->frequencyHz * (float32_t)harmonic;
+            if (expectedFrequencyHz > (float32_t)SIGNAL_FFT_PEAK_SEARCH_MAX_FREQUENCY_HZ + harmonicToleranceHz) {
+                break;
+            }
+
+            if (fabsf(peak->frequencyHz - expectedFrequencyHz) <= harmonicToleranceHz) {
+                explainedByOddHarmonic = true;
+                break;
+            }
+        }
+
+        if (!explainedByOddHarmonic) {
+            return false;
+        }
+    }
+
+    *centerFrequencyHz = fundamentalCluster->frequencyHz;
+    return true;
+}
+
+static void ProcessZoomFFT(void) {
+    if (!SignalZoomFFT_IsCaptureComplete()) {
+        return;
+    }
+
+    ADC_Capture_ClearStreamCallback();
+
+    SignalZoomFftResult zoomResult;
+    bool zoomSuccess = SignalZoomFFT_Analyze(&zoomResult);
+    PrintZoomFFTResult(&zoomResult);
+
+    if (!zoomSuccess || zoomResult.pattern != SIGNAL_ZOOM_FFT_PATTERN_TWO_SEPARATED) {
+        if (coarseModelFallbackAvailable) {
+            printf("Zoom FFT found no close pair; accepting the saved coarse model.\r\n");
+            printf("Final signals: A=%lu Hz %s, B=%lu Hz %s\r\n", (unsigned long)RoundFloatToUInt32(coarseFftResult.signalA.frequencyHz),
+                   SignalFFT_GetWaveformName(coarseFftResult.signalA.waveform), (unsigned long)RoundFloatToUInt32(coarseFftResult.signalB.frequencyHz),
+                   SignalFFT_GetWaveformName(coarseFftResult.signalB.waveform));
+            signalAnalysisState = SIGNAL_ANALYSIS_COMPLETE;
+            return;
+        }
+        printf("Zoom FFT failed to resolve two valid fundamentals.\r\n");
+        signalAnalysisState = SIGNAL_ANALYSIS_ERROR;
+        return;
+    }
+
+    uint32_t frequencyAHz = RoundFloatToUInt32(zoomResult.signalA.frequencyHz);
+    uint32_t frequencyBHz = RoundFloatToUInt32(zoomResult.signalB.frequencyHz);
+
+    if (frequencyAHz < SIGNAL_FFT_MIN_FREQUENCY_HZ) {
+        frequencyAHz = SIGNAL_FFT_MIN_FREQUENCY_HZ;
+    }
+    if (frequencyAHz > SIGNAL_FFT_MAX_FREQUENCY_HZ) {
+        frequencyAHz = SIGNAL_FFT_MAX_FREQUENCY_HZ;
+    }
+    if (frequencyBHz < SIGNAL_FFT_MIN_FREQUENCY_HZ) {
+        frequencyBHz = SIGNAL_FFT_MIN_FREQUENCY_HZ;
+    }
+    if (frequencyBHz > SIGNAL_FFT_MAX_FREQUENCY_HZ) {
+        frequencyBHz = SIGNAL_FFT_MAX_FREQUENCY_HZ;
+    }
+
+    bool modelSuccess = SignalFFT_FitResolvedFundamentals(frequencyAHz, frequencyBHz, &coarseFftResult);
+
+    printf("\r\n[HARMONIC_MODEL_RESULT]\r\n");
+    if (coarseFftResult.signalA.valid && coarseFftResult.signalB.valid) {
+        printf("A: frequency=%lu Hz, waveform=%s, amplitude=%lu codes peak, phase=%lu deg\r\n",
+               (unsigned long)RoundFloatToUInt32(coarseFftResult.signalA.frequencyHz), SignalFFT_GetWaveformName(coarseFftResult.signalA.waveform),
+               (unsigned long)RoundFloatToUInt32(coarseFftResult.signalA.amplitudePeakCode),
+               (unsigned long)RoundFloatToUInt32(coarseFftResult.signalA.phaseDegrees));
+        printf("B: frequency=%lu Hz, waveform=%s, amplitude=%lu codes peak, phase=%lu deg\r\n",
+               (unsigned long)RoundFloatToUInt32(coarseFftResult.signalB.frequencyHz), SignalFFT_GetWaveformName(coarseFftResult.signalB.waveform),
+               (unsigned long)RoundFloatToUInt32(coarseFftResult.signalB.amplitudePeakCode),
+               (unsigned long)RoundFloatToUInt32(coarseFftResult.signalB.phaseDegrees));
+        printf("Model residual: %lu permille (%s)\r\n", (unsigned long)RoundFloatToUInt32(coarseFftResult.residualRatio * 1000.0f),
+               modelSuccess ? "accepted" : "rejected");
+    }
+    printf("[HARMONIC_MODEL_RESULT_END]\r\n");
+
+    if (!modelSuccess) {
+        printf("Harmonic model rejected the two Zoom FFT fundamentals.\r\n");
+        signalAnalysisState = SIGNAL_ANALYSIS_ERROR;
+        return;
+    }
+
+    printf("Decision: Zoom FFT resolved the close fundamentals and the harmonic model was accepted.\r\n");
+    printf("Final signals: A=%lu Hz %s, B=%lu Hz %s\r\n", (unsigned long)frequencyAHz, SignalFFT_GetWaveformName(coarseFftResult.signalA.waveform),
+           (unsigned long)frequencyBHz, SignalFFT_GetWaveformName(coarseFftResult.signalB.waveform));
+    signalAnalysisState = SIGNAL_ANALYSIS_COMPLETE;
+}
+
+static void PrintCoarseFFTResult(const SignalFftResult* result) {
+    printf("\r\n[FFT_RESULT]\r\n");
+    printf("Mean: %lu codes\r\n", (unsigned long)RoundFloatToUInt32(result->meanCode));
+    printf("Resolution: %lu Hz/bin\r\n", (unsigned long)RoundFloatToUInt32(result->binResolutionHz));
+    printf("Significant peaks: %lu, fundamental candidates: %lu\r\n", (unsigned long)result->significantPeakCount,
+           (unsigned long)result->fundamentalCandidateCount);
+
+    for (uint32_t index = 0U; index < result->significantPeakCount; index++) {
+        const SignalFftPeak* peak = &result->significantPeaks[index];
+        printf("Peak %lu: raw=%lu Hz, bin=%lu, amplitude=%lu codes Vpp\r\n", (unsigned long)(index + 1U), (unsigned long)RoundFloatToUInt32(peak->frequencyHz),
+               (unsigned long)peak->peakBin, (unsigned long)RoundFloatToUInt32(peak->amplitudePeakToPeakCode));
+    }
+
+    if (result->signalA.valid && result->signalB.valid) {
+        printf("A: frequency=%lu Hz, waveform=%s, amplitude=%lu codes peak, phase=%lu deg\r\n", (unsigned long)RoundFloatToUInt32(result->signalA.frequencyHz),
+               SignalFFT_GetWaveformName(result->signalA.waveform), (unsigned long)RoundFloatToUInt32(result->signalA.amplitudePeakCode),
+               (unsigned long)RoundFloatToUInt32(result->signalA.phaseDegrees));
+        printf("B: frequency=%lu Hz, waveform=%s, amplitude=%lu codes peak, phase=%lu deg\r\n", (unsigned long)RoundFloatToUInt32(result->signalB.frequencyHz),
+               SignalFFT_GetWaveformName(result->signalB.waveform), (unsigned long)RoundFloatToUInt32(result->signalB.amplitudePeakCode),
+               (unsigned long)RoundFloatToUInt32(result->signalB.phaseDegrees));
+        printf("Model residual: %lu permille (%s)\r\n", (unsigned long)RoundFloatToUInt32(result->residualRatio * 1000.0f),
+               result->valid ? "accepted" : "rejected");
+    }
+
+    printf("FFT time: %lu us, total analysis: %lu us\r\n", (unsigned long)RoundFloatToUInt32(result->fftTimeUs),
+           (unsigned long)RoundFloatToUInt32(result->totalTimeUs));
+    printf("[FFT_RESULT_END]\r\n");
+}
+
+static void PrintZoomFFTResult(const SignalZoomFftResult* result) {
+    printf("\r\n[ZOOM_FFT_RESULT]\r\n");
+    printf("Center: %lu Hz\r\n", (unsigned long)RoundFloatToUInt32(result->centerFrequencyHz));
+    printf("Rates: input=%lu samples/s, baseband=%lu samples/s\r\n", (unsigned long)result->inputSampleRateHz, (unsigned long)result->outputSampleRateHz);
+    printf("Resolution: %lu Hz/bin\r\n", (unsigned long)RoundFloatToUInt32(result->binResolutionHz));
+    printf("Capture: %lu raw samples, %lu us\r\n", (unsigned long)result->rawSampleCount, (unsigned long)RoundFloatToUInt32(result->captureTimeUs));
+
+    if (!result->valid) {
+        printf("Pattern: none\r\n");
+    }
+    else if (result->pattern == SIGNAL_ZOOM_FFT_PATTERN_TWO_SEPARATED) {
+        printf("Pattern: two separated peaks\r\n");
+        printf("A: raw=%lu Hz, baseband=%ld Hz, bin=%ld, amplitude=%lu codes Vpp\r\n", (unsigned long)RoundFloatToUInt32(result->signalA.frequencyHz),
+               (long)RoundFloatToInt32(result->signalA.basebandFrequencyHz), (long)result->signalA.peakBin,
+               (unsigned long)RoundFloatToUInt32(result->signalA.amplitudePeakToPeakCode));
+        printf("B: raw=%lu Hz, baseband=%ld Hz, bin=%ld, amplitude=%lu codes Vpp\r\n", (unsigned long)RoundFloatToUInt32(result->signalB.frequencyHz),
+               (long)RoundFloatToInt32(result->signalB.basebandFrequencyHz), (long)result->signalB.peakBin,
+               (unsigned long)RoundFloatToUInt32(result->signalB.amplitudePeakToPeakCode));
+    }
+    else {
+        printf("Pattern: single unresolved cluster\r\n");
+        printf("Cluster: raw=%lu Hz, baseband=%ld Hz, bin=%ld, amplitude=%lu codes Vpp\r\n",
+               (unsigned long)RoundFloatToUInt32(result->dominantPeak.frequencyHz), (long)RoundFloatToInt32(result->dominantPeak.basebandFrequencyHz),
+               (long)result->dominantPeak.peakBin, (unsigned long)RoundFloatToUInt32(result->dominantPeak.amplitudePeakToPeakCode));
+    }
+
+    printf("DDC CPU time: %lu us\r\n", (unsigned long)RoundFloatToUInt32(result->ddcTimeUs));
+    printf("DDC callback max: %lu us, overruns=%lu\r\n", (unsigned long)RoundFloatToUInt32(result->maximumDdcCallbackTimeUs),
+           (unsigned long)result->ddcOverrunCount);
+    printf("Zoom FFT time: %lu us, analysis: %lu us\r\n", (unsigned long)RoundFloatToUInt32(result->fftTimeUs),
+           (unsigned long)RoundFloatToUInt32(result->analysisTimeUs));
+    printf("[ZOOM_FFT_RESULT_END]\r\n");
+}
+
+static uint32_t RoundFloatToUInt32(float32_t value) {
+    if (value <= 0.0f) {
+        return 0U;
+    }
+
+    return (uint32_t)(value + 0.5f);
+}
+
+static int32_t RoundFloatToInt32(float32_t value) {
+    if (value >= 0.0f) {
+        return (int32_t)(value + 0.5f);
+    }
+
+    return (int32_t)(value - 0.5f);
+}
+
 /**
   * @brief  Redirects printf output to USART1.
   * @param  ch Character to transmit.
@@ -248,33 +587,6 @@ int __io_putchar(int ch) {
     }
 
     return ch;
-}
-
-/**
-  * @brief  Prints one FFT analysis result without float printf support.
-  * @param  result FFT result.
-  */
-static void PrintFFTResult(const SignalFftResult* result) {
-    uint32_t frequencyA = (uint32_t)(result->signalA.frequencyHz + 0.5f);
-    uint32_t nominalFrequencyA = (uint32_t)(result->signalA.nominalFrequencyHz + 0.5f);
-    uint32_t amplitudeA = (uint32_t)(result->signalA.amplitudePeakToPeakCode + 0.5f);
-
-    uint32_t frequencyB = (uint32_t)(result->signalB.frequencyHz + 0.5f);
-    uint32_t nominalFrequencyB = (uint32_t)(result->signalB.nominalFrequencyHz + 0.5f);
-    uint32_t amplitudeB = (uint32_t)(result->signalB.amplitudePeakToPeakCode + 0.5f);
-
-    uint32_t meanCode = (uint32_t)(result->meanCode + 0.5f);
-    uint32_t fftTimeUs = (uint32_t)(result->fftTimeUs + 0.5f);
-    uint32_t totalTimeUs = (uint32_t)(result->totalTimeUs + 0.5f);
-
-    printf("\r\n[FFT_RESULT]\r\n");
-    printf("Mean: %lu codes\r\n", (unsigned long)meanCode);
-    printf("A: raw=%lu Hz, nominal=%lu Hz, bin=%lu, amplitude=%lu codes Vpp\r\n", (unsigned long)frequencyA, (unsigned long)nominalFrequencyA,
-           (unsigned long)result->signalA.peakBin, (unsigned long)amplitudeA);
-    printf("B: raw=%lu Hz, nominal=%lu Hz, bin=%lu, amplitude=%lu codes Vpp\r\n", (unsigned long)frequencyB, (unsigned long)nominalFrequencyB,
-           (unsigned long)result->signalB.peakBin, (unsigned long)amplitudeB);
-    printf("FFT time: %lu us, total analysis: %lu us\r\n", (unsigned long)fftTimeUs, (unsigned long)totalTimeUs);
-    printf("[FFT_RESULT_END]\r\n");
 }
 
 /* USER CODE END 4 */
@@ -312,6 +624,7 @@ void MPU_Config(void) {
   */
 void Error_Handler(void) {
     /* USER CODE BEGIN Error_Handler_Debug */
+    ADC_Capture_ClearStreamCallback();
     __disable_irq();
 
     while (1) {}
