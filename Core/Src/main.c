@@ -20,6 +20,8 @@
 #include "main.h"
 #include "adc.h"
 #include "bdma.h"
+#include "dac.h"
+#include "dma.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -27,6 +29,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "adc_capture.h"
+#include "dac_nco.h"
+#include "iq_phase_monitor.h"
 #include "signal_fft.h"
 #include "signal_zoom_fft.h"
 
@@ -49,7 +53,6 @@ typedef enum {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -75,6 +78,7 @@ void SystemClock_Config(void);
 void PeriphCommonClock_Config(void);
 static void MPU_Config(void);
 /* USER CODE BEGIN PFP */
+static bool StartDacWaveforms(const SignalFftSeparatedSignal* signalA, const SignalFftSeparatedSignal* signalB);
 static void ProcessCoarseFFT(void);
 static void ProcessZoomFFT(void);
 static void ProcessSerialCommand(void);
@@ -88,6 +92,14 @@ static int32_t RoundFloatToInt32(float32_t value);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static bool StartDacWaveforms(const SignalFftSeparatedSignal* signalA, const SignalFftSeparatedSignal* signalB) {
+    if (!DacNco_Start(signalA, signalB)) {
+        return false;
+    }
+
+    IqPhaseMonitor_Start(signalA->frequencyHz, signalB->frequencyHz, coarseFftResult.meanCode);
+    return true;
+}
 
 /* USER CODE END 0 */
 
@@ -125,10 +137,13 @@ int main(void) {
     /* Initialize all configured peripherals */
     MX_GPIO_Init();
     MX_BDMA_Init();
+    MX_DMA_Init();
     MX_USART1_UART_Init();
     MX_USART2_UART_Init();
     MX_ADC3_Init();
     MX_TIM2_Init();
+    MX_DAC1_Init();
+    MX_TIM6_Init();
     /* USER CODE BEGIN 2 */
     setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -144,6 +159,8 @@ int main(void) {
     printf("Peak search: %lu to %lu Hz\r\n", (unsigned long)SIGNAL_FFT_MIN_FREQUENCY_HZ, (unsigned long)SIGNAL_FFT_PEAK_SEARCH_MAX_FREQUENCY_HZ);
     printf("Models: sine/triangle, complex harmonic overlap\r\n");
     printf("Zoom FFT: %lu complex points, decimation=%lu\r\n", (unsigned long)SIGNAL_ZOOM_FFT_SIZE, (unsigned long)SIGNAL_ZOOM_FFT_DECIMATION_FACTOR);
+    printf("DAC: dual streaming NCO at %lu samples/s, no 5 kHz quantization\r\n", (unsigned long)DAC_NCO_SAMPLE_RATE_HZ);
+    printf("PLL: channel A and B IQ PI tracking enabled with shared recovery logic\r\n");
     printf("Commands: RESET\r\n");
     printf("========================================\r\n");
 
@@ -174,6 +191,8 @@ int main(void) {
     while (1) {
         ProcessSerialCommand();
         ADC_Capture_Process();
+        DacNco_ProcessDiagnostics();
+        IqPhaseMonitor_Process();
 
         switch (signalAnalysisState) {
             case SIGNAL_ANALYSIS_WAIT_COARSE:
@@ -274,14 +293,22 @@ static void ProcessSerialCommand(void) {
         return;
     }
 
+    if (strcmp(uartCommandBuffer, "RESET") == 0) {
+        NVIC_SystemReset();
+    }
+
     printf("ERROR: unknown command: %s\r\n", uartCommandBuffer);
     uartCommandLength = 0U;
     uartCommandReady = false;
-    (void)HAL_UART_Receive_IT(&huart1, &uartRxByte, 1U);
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef* huart) {
     if (huart->Instance != USART1) {
+        return;
+    }
+
+    if (uartCommandReady) {
+        (void)HAL_UART_Receive_IT(&huart1, &uartRxByte, 1U);
         return;
     }
 
@@ -294,7 +321,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef* huart) {
             }
 
             uartCommandReady = true;
-            return;
         }
     }
     else if (uartCommandLength < sizeof(uartCommandBuffer) - 1U) {
@@ -305,6 +331,17 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef* huart) {
         uartCommandLength = 0U;
     }
 
+    (void)HAL_UART_Receive_IT(&huart1, &uartRxByte, 1U);
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef* huart) {
+    if (huart->Instance != USART1) {
+        return;
+    }
+
+    __HAL_UART_CLEAR_OREFLAG(huart);
+    uartCommandLength = 0U;
+    uartCommandReady = false;
     (void)HAL_UART_Receive_IT(&huart1, &uartRxByte, 1U);
 }
 
@@ -334,7 +371,7 @@ static void ProcessCoarseFFT(void) {
         printf("Final signals: A=%lu Hz %s, B=%lu Hz %s\r\n", (unsigned long)RoundFloatToUInt32(coarseFftResult.signalA.frequencyHz),
                SignalFFT_GetWaveformName(coarseFftResult.signalA.waveform), (unsigned long)RoundFloatToUInt32(coarseFftResult.signalB.frequencyHz),
                SignalFFT_GetWaveformName(coarseFftResult.signalB.waveform));
-        signalAnalysisState = SIGNAL_ANALYSIS_COMPLETE;
+        signalAnalysisState = StartDacWaveforms(&coarseFftResult.signalA, &coarseFftResult.signalB) ? SIGNAL_ANALYSIS_COMPLETE : SIGNAL_ANALYSIS_ERROR;
         return;
     }
 
@@ -442,7 +479,7 @@ static void ProcessZoomFFT(void) {
             printf("Final signals: A=%lu Hz %s, B=%lu Hz %s\r\n", (unsigned long)RoundFloatToUInt32(coarseFftResult.signalA.frequencyHz),
                    SignalFFT_GetWaveformName(coarseFftResult.signalA.waveform), (unsigned long)RoundFloatToUInt32(coarseFftResult.signalB.frequencyHz),
                    SignalFFT_GetWaveformName(coarseFftResult.signalB.waveform));
-            signalAnalysisState = SIGNAL_ANALYSIS_COMPLETE;
+            signalAnalysisState = StartDacWaveforms(&coarseFftResult.signalA, &coarseFftResult.signalB) ? SIGNAL_ANALYSIS_COMPLETE : SIGNAL_ANALYSIS_ERROR;
             return;
         }
         printf("Zoom FFT failed to resolve two valid fundamentals.\r\n");
@@ -492,7 +529,7 @@ static void ProcessZoomFFT(void) {
     printf("Decision: Zoom FFT resolved the close fundamentals and the harmonic model was accepted.\r\n");
     printf("Final signals: A=%lu Hz %s, B=%lu Hz %s\r\n", (unsigned long)frequencyAHz, SignalFFT_GetWaveformName(coarseFftResult.signalA.waveform),
            (unsigned long)frequencyBHz, SignalFFT_GetWaveformName(coarseFftResult.signalB.waveform));
-    signalAnalysisState = SIGNAL_ANALYSIS_COMPLETE;
+    signalAnalysisState = StartDacWaveforms(&coarseFftResult.signalA, &coarseFftResult.signalB) ? SIGNAL_ANALYSIS_COMPLETE : SIGNAL_ANALYSIS_ERROR;
 }
 
 static void PrintCoarseFFTResult(const SignalFftResult* result) {
