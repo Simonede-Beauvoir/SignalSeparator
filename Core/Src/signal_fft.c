@@ -9,6 +9,7 @@
 #define FFT_PI                     3.14159265358979323846f
 #define FFT_TWO_PI                 6.28318530717958647692f
 #define FFT_TRIANGLE_SCALE         0.81056946913870217155f
+#define FFT_SQUARE_SCALE           1.27323954473516268615f
 #define FFT_HANN_GAIN              0.5f
 #define FFT_MAX_LOCAL_PEAKS        128U
 #define FFT_MAX_MODEL_BINS          48U
@@ -170,6 +171,9 @@ const char* SignalFFT_GetWaveformName(SignalWaveformType waveform) {
     }
     if (waveform == SIGNAL_WAVEFORM_TRIANGLE) {
         return "triangle";
+    }
+    if (waveform == SIGNAL_WAVEFORM_SQUARE) {
+        return "square";
     }
     return "unknown";
 }
@@ -407,10 +411,12 @@ static void AddModelBin(uint32_t bin, uint32_t* count) {
 }
 
 static void AddHarmonicBins(uint32_t frequencyHz, SignalWaveformType waveform, uint32_t sampleRateHz, uint32_t* count) {
-    (void)waveform;
     for (uint32_t harmonic = 1U; harmonic * frequencyHz <= SIGNAL_FFT_PEAK_SEARCH_MAX_FREQUENCY_HZ; harmonic += 2U) {
         uint32_t bin = (uint32_t)(((uint64_t)harmonic * frequencyHz * SIGNAL_FFT_SIZE + sampleRateHz / 2U) / sampleRateHz);
         AddModelBin(bin, count);
+        if (waveform == SIGNAL_WAVEFORM_SINE) {
+            break;
+        }
     }
 }
 
@@ -456,6 +462,9 @@ static ComplexValue SourceCoefficient(uint32_t frequencyHz, SignalWaveformType w
         if (waveform == SIGNAL_WAVEFORM_TRIANGLE) {
             float32_t sign = (((harmonic - 1U) / 2U) & 1U) == 0U ? 1.0f : -1.0f;
             coefficient = sign * FFT_TRIANGLE_SCALE / (float32_t)(harmonic * harmonic);
+        }
+        else if (waveform == SIGNAL_WAVEFORM_SQUARE) {
+            coefficient = FFT_SQUARE_SCALE / (float32_t)harmonic;
         }
         float32_t harmonicPhase = (float32_t)harmonic * phase;
         float32_t sine = arm_sin_f32(harmonicPhase);
@@ -570,8 +579,8 @@ static bool FindBestModel(uint32_t sampleRateHz, SignalFftResult* result) {
     bool found = false;
     for (uint32_t indexA = 0U; indexA + 1U < result->fundamentalCandidateCount; indexA++) {
         for (uint32_t indexB = indexA + 1U; indexB < result->fundamentalCandidateCount; indexB++) {
-            for (SignalWaveformType waveformA = SIGNAL_WAVEFORM_SINE; waveformA <= SIGNAL_WAVEFORM_TRIANGLE; waveformA++) {
-                for (SignalWaveformType waveformB = SIGNAL_WAVEFORM_SINE; waveformB <= SIGNAL_WAVEFORM_TRIANGLE; waveformB++) {
+            for (SignalWaveformType waveformA = SIGNAL_WAVEFORM_SINE; waveformA <= SIGNAL_WAVEFORM_SQUARE; waveformA++) {
+                for (SignalWaveformType waveformB = SIGNAL_WAVEFORM_SINE; waveformB <= SIGNAL_WAVEFORM_SQUARE; waveformB++) {
                     uint32_t frequencyA = candidates[indexA].frequencyHz;
                     uint32_t frequencyB = candidates[indexB].frequencyHz;
                     uint32_t binCount = BuildModelBins(frequencyA, waveformA, frequencyB, waveformB, result, sampleRateHz);

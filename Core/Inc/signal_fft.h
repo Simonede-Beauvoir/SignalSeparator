@@ -25,7 +25,8 @@ extern "C" {
 typedef enum {
     SIGNAL_WAVEFORM_UNKNOWN = 0,
     SIGNAL_WAVEFORM_SINE,
-    SIGNAL_WAVEFORM_TRIANGLE
+    SIGNAL_WAVEFORM_TRIANGLE,
+    SIGNAL_WAVEFORM_SQUARE
 } SignalWaveformType;
 
 typedef struct {
@@ -72,7 +73,7 @@ typedef struct {
 arm_status SignalFFT_Init(void);
 
 /**
-  * @brief  Separates two sine or triangle signals using complex FFT models.
+  * @brief  Separates two sine, triangle, or square signals using complex FFT models.
   * @param  samples Pointer to unsigned 12-bit ADC samples.
   * @param  sampleCount Number of samples; must equal SIGNAL_FFT_SIZE.
   * @param  sampleRateHz ADC sample rate in samples per second.
@@ -86,7 +87,7 @@ bool SignalFFT_Analyze(const uint16_t* samples, uint32_t sampleCount, uint32_t s
   * @param  frequencyAHz First fundamental frequency resolved by Zoom FFT.
   * @param  frequencyBHz Second fundamental frequency resolved by Zoom FFT.
   * @param  result Coarse FFT result to update with the selected harmonic model.
-  * @retval true when an acceptable sine or triangle two-signal model is found.
+  * @retval true when an acceptable sine, triangle, or square two-signal model is found.
   * @note   SignalFFT_Analyze must be called first.
   */
 bool SignalFFT_FitResolvedFundamentals(uint32_t frequencyAHz, uint32_t frequencyBHz, SignalFftResult* result);

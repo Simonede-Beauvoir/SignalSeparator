@@ -32,6 +32,7 @@
 #include "dac_nco.h"
 #include "iq_phase_monitor.h"
 #include "signal_fft.h"
+#include "serial_command.h"
 #include "signal_zoom_fft.h"
 
 #include <math.h>
@@ -66,10 +67,6 @@ typedef enum {
 static SignalAnalysisState signalAnalysisState = SIGNAL_ANALYSIS_WAIT_COARSE;
 static SignalFftResult coarseFftResult;
 static bool coarseModelFallbackAvailable;
-static uint8_t uartRxByte;
-static char uartCommandBuffer[16];
-static volatile uint32_t uartCommandLength;
-static volatile bool uartCommandReady;
 
 /* USER CODE END PV */
 
@@ -81,7 +78,6 @@ static void MPU_Config(void);
 static bool StartDacWaveforms(const SignalFftSeparatedSignal* signalA, const SignalFftSeparatedSignal* signalB);
 static void ProcessCoarseFFT(void);
 static void ProcessZoomFFT(void);
-static void ProcessSerialCommand(void);
 static void PrintCoarseFFTResult(const SignalFftResult* result);
 static void PrintZoomFFTResult(const SignalZoomFftResult* result);
 static bool FindUnresolvedFundamentalCluster(const SignalFftResult* result, float32_t* centerFrequencyHz);
@@ -144,11 +140,12 @@ int main(void) {
     MX_TIM2_Init();
     MX_DAC1_Init();
     MX_TIM6_Init();
+    MX_TIM5_Init();
     /* USER CODE BEGIN 2 */
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    if (HAL_UART_Receive_IT(&huart1, &uartRxByte, 1U) != HAL_OK) {
-        printf("ERROR: USART1 command reception start failed.\r\n");
+    if (SerialCommand_Init() != HAL_OK) {
+        printf("ERROR: serial command reception start failed.\r\n");
         Error_Handler();
     }
 
@@ -157,11 +154,11 @@ int main(void) {
     printf("Signal separator Zoom FFT and harmonic model test\r\n");
     printf("Coarse FFT: %lu points at %lu samples/s\r\n", (unsigned long)SIGNAL_FFT_SIZE, (unsigned long)ADC_CAPTURE_SAMPLE_RATE_HZ);
     printf("Peak search: %lu to %lu Hz\r\n", (unsigned long)SIGNAL_FFT_MIN_FREQUENCY_HZ, (unsigned long)SIGNAL_FFT_PEAK_SEARCH_MAX_FREQUENCY_HZ);
-    printf("Models: sine/triangle, complex harmonic overlap\r\n");
+    printf("Models: sine/triangle/square, complex harmonic overlap\r\n");
     printf("Zoom FFT: %lu complex points, decimation=%lu\r\n", (unsigned long)SIGNAL_ZOOM_FFT_SIZE, (unsigned long)SIGNAL_ZOOM_FFT_DECIMATION_FACTOR);
     printf("DAC: dual streaming NCO at %lu samples/s, no 5 kHz quantization\r\n", (unsigned long)DAC_NCO_SAMPLE_RATE_HZ);
     printf("PLL: channel A and B IQ PI tracking enabled with shared recovery logic\r\n");
-    printf("Commands: RESET\r\n");
+    printf("Commands: RESET, SET PHASE 0|5|10|...|180\r\n");
     printf("========================================\r\n");
 
     if (SignalFFT_Init() != ARM_MATH_SUCCESS) {
@@ -189,7 +186,7 @@ int main(void) {
     /* Infinite loop */
     /* USER CODE BEGIN WHILE */
     while (1) {
-        ProcessSerialCommand();
+        SerialCommand_Process();
         ADC_Capture_Process();
         DacNco_ProcessDiagnostics();
         IqPhaseMonitor_Process();
@@ -288,61 +285,12 @@ void PeriphCommonClock_Config(void) {
 }
 
 /* USER CODE BEGIN 4 */
-static void ProcessSerialCommand(void) {
-    if (!uartCommandReady) {
-        return;
-    }
-
-    if (strcmp(uartCommandBuffer, "RESET") == 0) {
-        NVIC_SystemReset();
-    }
-
-    printf("ERROR: unknown command: %s\r\n", uartCommandBuffer);
-    uartCommandLength = 0U;
-    uartCommandReady = false;
-}
-
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef* huart) {
-    if (huart->Instance != USART1) {
-        return;
-    }
-
-    if (uartCommandReady) {
-        (void)HAL_UART_Receive_IT(&huart1, &uartRxByte, 1U);
-        return;
-    }
-
-    if (uartRxByte == '\r' || uartRxByte == '\n') {
-        if (uartCommandLength > 0U) {
-            uartCommandBuffer[uartCommandLength] = '\0';
-
-            if (strcmp(uartCommandBuffer, "RESET") == 0) {
-                NVIC_SystemReset();
-            }
-
-            uartCommandReady = true;
-        }
-    }
-    else if (uartCommandLength < sizeof(uartCommandBuffer) - 1U) {
-        uartCommandBuffer[uartCommandLength] = (char)uartRxByte;
-        uartCommandLength++;
-    }
-    else {
-        uartCommandLength = 0U;
-    }
-
-    (void)HAL_UART_Receive_IT(&huart1, &uartRxByte, 1U);
+    SerialCommand_RxCpltCallback(huart);
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef* huart) {
-    if (huart->Instance != USART1) {
-        return;
-    }
-
-    __HAL_UART_CLEAR_OREFLAG(huart);
-    uartCommandLength = 0U;
-    uartCommandReady = false;
-    (void)HAL_UART_Receive_IT(&huart1, &uartRxByte, 1U);
+    SerialCommand_ErrorCallback(huart);
 }
 
 static void ProcessCoarseFFT(void) {
@@ -360,7 +308,8 @@ static void ProcessCoarseFFT(void) {
 
     /*
      * A valid coarse model can still be ambiguous. For example, the third
-     * harmonic of a triangle wave may be fitted as an independent sine while
+     * harmonic of a triangle or square wave may be fitted as an independent
+     * sine while
      * two close fundamentals remain inside one coarse FFT main lobe. Resolve
      * that low-frequency cluster with Zoom FFT before accepting the coarse
      * model. Keep the coarse result as a fallback for a genuine fundamental
@@ -427,7 +376,7 @@ static bool FindUnresolvedFundamentalCluster(const SignalFftResult* result, floa
     }
 
     /*
-     * A close pair produces one coarse fundamental cluster. A triangle-wave
+     * A close pair produces one coarse fundamental cluster. A non-sinusoidal
      * harmonic must not be mistaken for a second already-resolved
      * fundamental. Four coarse bins cover the frequency bias caused by two
      * unresolved fundamentals sharing the same Hann-window main lobe.

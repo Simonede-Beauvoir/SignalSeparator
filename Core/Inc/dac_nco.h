@@ -32,6 +32,13 @@ void DacNco_SetChannelAFrequency(float32_t frequencyHz);
 void DacNco_SetChannelBFrequency(float32_t frequencyHz);
 
 /**
+  * @brief  Sets the initial phase difference of channel B relative to A.
+  * @param  phaseDegrees Phase difference from 0 to 180 degrees.
+  * @retval true when the phase setting is stored or applied successfully.
+  */
+bool DacNco_SetPhaseDifference(uint32_t phaseDegrees);
+
+/**
   * @brief  Prints periodic DMA refill and error diagnostics.
   */
 void DacNco_ProcessDiagnostics(void);

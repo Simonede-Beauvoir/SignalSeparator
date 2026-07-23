@@ -54,8 +54,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
         Core/Src/adc_capture.c
         Core/Src/dac_nco.c
         Core/Src/iq_phase_monitor.c
+        Core/Src/serial_command.c
         Core/Src/signal_fft.c
         Core/Src/signal_zoom_fft.c
+        Core/Src/square_wave_output.c
 )
 
 # Add include paths
